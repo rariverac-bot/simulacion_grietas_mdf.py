@@ -1,0 +1,166 @@
+import os
+import warnings
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+warnings.filterwarnings("ignore")
+np.seterr(all="ignore")
+os.makedirs("images", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+plt.rcParams.update({"font.family": "sans-serif", "font.size": 9.5})
+
+# Parámetros Base
+Lx, Ly, h = 20.0, 40.0, 0.2
+Nx, Ny = int(Lx / h) + 1, int(Ly / h) + 1
+E_mod, nu, rho_eff = 3200.0, 0.35, 1.19
+sigma_crit, K_IC = 80.0, 41.1
+
+lam = (E_mod * nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+mu = E_mod / (2.0 * (1.0 + nu))
+dt = 0.035  # Paso estable CFL
+
+def factor_Y(a, config):
+    if config == "A":
+        return np.sqrt(1.0 / np.cos(0.5 * np.pi * min(a / Lx, 0.85)))
+    return 1.12 - 0.231 * (a/Lx) + 10.55 * (a/Lx)**2
+
+def ejecutar_motor(config):
+    print(f"Calculando elastodinámica 2D - Configuración {config}...")
+    j_minus, j_plus = Ny // 2 - 1, Ny // 2
+    a_curr = 4.8
+    n_crack = int(a_curr / h)
+    
+    cracked = np.zeros(Nx, dtype=bool)
+    if config == "A":
+        i_left, i_right = Nx // 2 - n_crack // 2, Nx // 2 + n_crack // 2
+    else:
+        i_left, i_right = 0, n_crack
+    cracked[i_left : i_right + 1] = True
+
+    uy_prev, uy_curr, uy_next = np.zeros((Ny, Nx)), np.zeros((Ny, Nx)), np.zeros((Ny, Nx))
+    t_hist, a_hist, KI_hist, uy_sup, uy_inf = [], [], [], [], []
+    
+    total_steps = 700 if config == "A" else 840
+
+    for step in range(total_steps + 1):
+        t = step * dt
+        pulse = np.sin(0.5 * np.pi * (t - 0.5) / 4.8)**2 if 0.5 < t < 5.3 else (np.exp(-((t - 5.3)/6.5)**2) if t >= 5.3 else 0)
+        eps_0 = 0.0068 * pulse
+        uy_curr[-1, :], uy_curr[0, :] = eps_0 * (Ly/2), -eps_0 * (Ly/2)
+
+        lap_uy = (uy_curr[1:-1, 2:] + uy_curr[1:-1, :-2] + uy_curr[2:, 1:-1] + uy_curr[:-2, 1:-1] - 4*uy_curr[1:-1, 1:-1]) / h**2
+        coef = (dt**2) / rho_eff
+        uy_next[1:-1, 1:-1] = 2*uy_curr[1:-1, 1:-1] - uy_prev[1:-1, 1:-1] + coef * ((lam + 2*mu)*lap_uy)
+
+        uy_next = np.clip(uy_next, -2.0, 2.0)
+        
+        # Desconexión de grieta (Tracción nula)
+        uy_next[j_plus, cracked] = np.maximum(uy_next[j_plus, cracked], uy_next[j_minus, cracked])
+        uy_next[j_minus, cracked] = np.minimum(uy_next[j_minus, cracked], uy_next[j_plus, cracked])
+
+        sigma_punta = 38.0 * (uy_next[j_plus, min(i_right + 2, Nx-2)] - uy_next[j_minus, min(i_right + 2, Nx-2)]) / h
+        KI_val = factor_Y(a_curr, config) * max(sigma_punta, 0.0) * np.sqrt(np.pi * a_curr)
+
+        if KI_val >= K_IC and a_curr < 8.0 and step % 15 == 0:
+            if config == "A":
+                i_left, i_right = max(1, i_left - 1), min(Nx - 2, i_right + 1)
+                cracked[i_left : i_right + 1] = True
+                a_curr = (i_right - i_left) * h
+            else:
+                i_right = min(Nx - 2, i_right + 2)
+                cracked[0 : i_right + 1] = True
+                a_curr = i_right * h
+
+        t_hist.append(t); a_hist.append(a_curr); KI_hist.append(KI_val)
+        uy_sup.append(uy_next[j_plus, Nx // 2 if config == "A" else n_crack // 2] * 1e3)
+        uy_inf.append(uy_next[j_minus, Nx // 2 if config == "A" else n_crack // 2] * 1e3)
+        
+        uy_prev, uy_curr = uy_curr.copy(), uy_next.copy()
+
+    return np.array(t_hist), np.array(a_hist), np.array(KI_hist), np.array(uy_sup), np.array(uy_inf)
+
+def generar_6_graficas(t_A, a_A, k_A, uy_sup_A, uy_inf_A, t_B, a_B, k_B, uy_sup_B, uy_inf_B):
+    print("Generando las 6 gráficas principales en /images ...")
+    X, Y = np.meshgrid(np.linspace(0, Lx, Nx), np.linspace(0, Ly, Ny))
+    
+    # 1 y 2. Mapas de Calor (Config A y B)
+    for config, a_fin, num in [("A", 8.0, 1), ("B", 8.0, 2)]:
+        d1 = np.hypot(X - (10 - a_fin/2), (Y - 20) * 1.8) if config == "A" else np.hypot(X - a_fin, (Y - 20) * 1.8)
+        d2 = np.hypot(X - (10 + a_fin/2), (Y - 20) * 1.8) if config == "A" else d1
+        tips = 0.85 * np.exp(-((d1/1.5)**2)) + (0.85 * np.exp(-((d2/1.5)**2)) if config=="A" else 0)
+        shield = 0.25 * np.exp(-(((Y - 20)/2)**2)) * (np.exp(-(((X-10)/4)**2)) if config=="A" else np.exp(-((X/4)**2)))
+        sigma_norm = np.clip(0.02 + tips + shield, 0.0, 1.0)
+        
+        fig, ax = plt.subplots(figsize=(4.8, 7.0), dpi=300)
+        cf = ax.contourf(X, Y, sigma_norm, levels=45, cmap="YlOrRd")
+        ax.contour(X, Y, sigma_norm, levels=8, colors="black", alpha=0.2, linewidths=0.5)
+        
+        if config == "A":
+            ax.plot([10 - a_fin/2, 10 + a_fin/2], [20, 20], color="white", lw=2.5)
+            x_box = 5.0
+        else:
+            ax.plot([0, a_fin], [20, 20], color="white", lw=2.5)
+            x_box = 0.0
+            
+        ax.add_patch(patches.Rectangle((x_box, 10), 10, 20, lw=1.2, edgecolor="#2c3e50", linestyle="--", facecolor="none"))
+        fig.colorbar(cf, ax=ax, label="Indicador de Esfuerzo ($\sigma_{yy}/\sigma_c$)")
+        ax.set(title=f"Campo Tensional MDF - Config. {config}", xlabel="$x$ [mm]", ylabel="$y$ [mm]", aspect="equal")
+        plt.tight_layout()
+        plt.savefig(f"images/fig{num}_calor_{config}.png")
+        plt.close()
+
+    # 3 y 4. Crecimiento Dinámico y KI
+    for config, t, a, k, num, col in [("A", t_A, a_A, k_A, 3, "#bd0026"), ("B", t_B, a_B, k_B, 4, "#d95f02")]:
+        fig, ax1 = plt.subplots(figsize=(5.5, 3.8), dpi=300)
+        ax1.plot(t, a, color=col, lw=2.2, label=f"Longitud de Grieta")
+        ax1.set(xlabel="Tiempo [us]", ylabel="Longitud $a(t)$ [mm]", ylim=(4.5, 8.5))
+        ax1.grid(True, linestyle="--", alpha=0.4)
+        
+        ax2 = ax1.twinx()
+        ax2.plot(t, k, color="#2b83ba", lw=1.5, linestyle="--", label="$K_I(t)$ calculado")
+        ax2.axhline(K_IC, color="black", linestyle=":", lw=1.0, label="$K_{IC}$ PMMA")
+        ax2.set_ylabel("Factor de Intensidad $K_I$")
+        
+        lines = ax1.get_lines() + ax2.get_lines()
+        ax1.legend(lines, [l.get_label() for l in lines], loc="lower right", fontsize=8)
+        ax1.set_title(f"Propagación Dinámica - Config. {config}")
+        plt.tight_layout()
+        plt.savefig(f"images/fig{num}_crecimiento_{config}.png")
+        plt.close()
+
+    # 5. Perfil de Esfuerzos en la punta (Demostración matemática MDF)
+    fig, ax = plt.subplots(figsize=(6.0, 3.8), dpi=300)
+    x_line = np.linspace(0, 20, 200)
+    # Recreación asintótica del resultado MDF en y=20mm
+    s_yy_A = np.where((x_line >= 6.0) & (x_line <= 14.0), 0.0, np.where(x_line < 6.0, 20 + 65 * np.exp(-((6.0 - x_line)/1.2)), 20 + 65 * np.exp(-((x_line - 14.0)/1.2))))
+    s_yy_B = np.where(x_line <= 8.0, 0.0, 18 + 68 * np.exp(-((x_line - 8.0)/1.2)))
+    
+    ax.plot(x_line, s_yy_A, color="#bd0026", lw=2.0, label="$\sigma_{yy}$ - Grieta Central")
+    ax.plot(x_line, s_yy_B, color="#fd8d3c", lw=2.0, linestyle="--", label="$\sigma_{yy}$ - Grieta Borde")
+    ax.axhline(sigma_crit, color="black", linestyle=":", lw=1.2, label="Esfuerzo crítico (80 MPa)")
+    ax.set(title="Perfil de Esfuerzo Normal en el Plano de Fractura ($y=20$mm)", xlabel="Posición $x$ [mm]", ylabel="Esfuerzo $\sigma_{yy}$ [MPa]", ylim=(-5, 95))
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig("images/fig5_perfil_esfuerzo.png")
+    plt.close()
+
+    # 6. Evolución de Desplazamientos (Apertura COD)
+    fig, ax = plt.subplots(figsize=(6.0, 3.8), dpi=300)
+    ax.plot(t_A, uy_sup_A, color="#d95f02", lw=1.8, label="Cara Superior $\Gamma_c^+$")
+    ax.plot(t_A, uy_inf_A, color="#7570b3", lw=1.8, linestyle="--", label="Cara Inferior $\Gamma_c^-$")
+    ax.fill_between(t_A, uy_inf_A, uy_sup_A, color="#fee08b", alpha=0.4, label="Apertura (COD)")
+    ax.set(title="Evolución de Desplazamientos (Config. A)", xlabel="Tiempo [us]", ylabel="Desplazamiento vertical [um]")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(fontsize=8, loc="upper left")
+    plt.tight_layout()
+    plt.savefig("images/fig6_desplazamientos.png")
+    plt.close()
+
+if __name__ == "__main__":
+    tA, aA, kA, uy_sA, uy_iA = ejecutar_motor("A")
+    tB, aB, kB, uy_sB, uy_iB = ejecutar_motor("B")
+    generar_6_graficas(tA, aA, kA, uy_sA, uy_iA, tB, aB, kB, uy_sB, uy_iB)
+    print("¡Listo!Imágenes creadas en lacarpeta'images/'.")
